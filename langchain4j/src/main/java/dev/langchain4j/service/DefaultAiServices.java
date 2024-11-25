@@ -135,6 +135,11 @@ class DefaultAiServices<T> extends AiServices<T> {
 
                         Future<Moderation> moderationFuture = triggerModerationIfNeeded(method, messages);
 
+                        // TODO continue refactoring from here
+
+
+
+
                         List<ToolSpecification> toolSpecifications = context.toolSpecifications;
                         Map<String, ToolExecutor> toolExecutors = context.toolExecutors;
 
@@ -151,6 +156,11 @@ class DefaultAiServices<T> extends AiServices<T> {
                                 }
                             }
                         }
+
+
+
+
+
 
                         Type returnType = aiServicesInputMessageProcessor.returnType();
                         if (aiServicesInputMessageProcessor.streaming()) {
@@ -169,6 +179,11 @@ class DefaultAiServices<T> extends AiServices<T> {
                                 return adapt(tokenStream, returnType);
                             }
                         }
+
+
+
+
+
 
                         Response<AiMessage> response;
                         Optional<JsonSchema> jsonSchema = aiServicesInputMessageProcessor.jsonSchema();
