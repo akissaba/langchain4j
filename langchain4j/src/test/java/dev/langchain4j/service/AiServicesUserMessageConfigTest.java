@@ -229,7 +229,7 @@ class AiServicesUserMessageConfigTest {
         // when-then
         assertThatThrownBy(() -> aiService.illegalChat3("What is the capital of {{it}}?", "Germany"))
                 .isExactlyInstanceOf(IllegalConfigurationException.class)
-                .hasMessage("Parameter 'arg0' of method 'illegalChat3' should be annotated " +
+                .hasMessage("Parameter 'arg0' of method 'illegalChat3' should be a UserMessage or annotated " +
                         "with @V or @UserMessage or @UserName or @MemoryId");
     }
 
@@ -244,7 +244,7 @@ class AiServicesUserMessageConfigTest {
         // when-then
         assertThatThrownBy(() -> aiService.illegalChat4("What is the capital of {{it}}?", "Germany"))
                 .isExactlyInstanceOf(IllegalConfigurationException.class)
-                .hasMessage("Parameter 'arg1' of method 'illegalChat4' should be annotated " +
+                .hasMessage("Parameter 'arg1' of method 'illegalChat4' should be a UserMessage or annotated " +
                         "with @V or @UserMessage or @UserName or @MemoryId");
     }
 

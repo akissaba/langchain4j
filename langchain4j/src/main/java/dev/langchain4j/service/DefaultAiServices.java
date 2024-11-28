@@ -4,7 +4,9 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
@@ -39,6 +41,7 @@ import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -69,21 +72,40 @@ class DefaultAiServices<T> extends AiServices<T> {
         super(context);
     }
 
-    static void validateParameters(Method method) {
+    static void validateParameters(Method method, Object[] args) {
         Parameter[] parameters = method.getParameters();
-        if (parameters == null || parameters.length < 2) {
+        if (parameters.length <= 1) {
             return;
         }
 
-        for (Parameter parameter : parameters) {
+        int userMessageInstancesCount = 0;
+
+        for (int i = 0; i < parameters.length; i++) {
+            UserMessage userMessageInstance = args[i] instanceof UserMessage userMessage ? userMessage : null;
+            Parameter parameter = parameters[i];
             V v = parameter.getAnnotation(V.class);
             dev.langchain4j.service.UserMessage userMessage = parameter.getAnnotation(dev.langchain4j.service.UserMessage.class);
             MemoryId memoryId = parameter.getAnnotation(MemoryId.class);
             UserName userName = parameter.getAnnotation(UserName.class);
-            if (v == null && userMessage == null && memoryId == null && userName == null) {
+            if (userMessageInstance == null && v == null && userMessage == null && memoryId == null && userName == null) {
                 throw illegalConfiguration(
-                        "Parameter '%s' of method '%s' should be annotated with @V or @UserMessage " +
+                        "Parameter '%s' of method '%s' should be a UserMessage or annotated with @V or @UserMessage " +
                                 "or @UserName or @MemoryId", parameter.getName(), method.getName()
+                );
+            }
+
+            userMessageInstancesCount += userMessageInstance == null ? 0 : 1;
+            if (userMessageInstancesCount > 1) {
+                throw illegalConfiguration(
+                        "The method '%s' has multiple UserMessage parameters. Please use only one.",
+                        method.getName()
+                );
+            }
+
+            if (userMessageInstancesCount > 0 && (v != null || userMessage != null || userName != null)) {
+                throw illegalConfiguration(
+                        "The method '%s' has multiple parameters mixed with UserMessage included. Please use only one UserMessage or parameters which is not a UserMessage.",
+                        method.getName()
                 );
             }
         }
@@ -120,7 +142,7 @@ class DefaultAiServices<T> extends AiServices<T> {
                             return method.invoke(this, args);
                         }
 
-                        validateParameters(method);
+                        validateParameters(method, args);
 
                         Object memoryId = findMemoryId(method, args).orElse(DEFAULT);
 
@@ -322,11 +344,14 @@ class DefaultAiServices<T> extends AiServices<T> {
 
                     private UserMessage appendOutputFormatInstructions(Type returnType, UserMessage userMessage) {
                         String outputFormatInstructions = serviceOutputParser.outputFormatInstructions(returnType);
-                        String text = userMessage.singleText() + outputFormatInstructions;
+                        List<Content> contents = new LinkedList<>(userMessage.contents());
+                        if (isNotNullOrBlank(outputFormatInstructions)) {
+                            contents.add(TextContent.from(outputFormatInstructions));
+                        }
                         if (isNotNullOrBlank(userMessage.name())) {
-                            userMessage = UserMessage.from(userMessage.name(), text);
+                            userMessage = UserMessage.from(userMessage.name(), contents);
                         } else {
-                            userMessage = UserMessage.from(text);
+                            userMessage = UserMessage.from(contents);
                         }
                         return userMessage;
                     }
@@ -348,7 +373,7 @@ class DefaultAiServices<T> extends AiServices<T> {
     private Optional<SystemMessage> prepareSystemMessage(Object memoryId, Method method, Object[] args) {
         return findSystemMessageTemplate(memoryId, method)
                 .map(systemMessageTemplate -> PromptTemplate.from(systemMessageTemplate)
-                        .apply(findTemplateVariables(systemMessageTemplate, method, args))
+                        .apply(findTemplateVariables(systemMessageTemplate, method.getParameters(), args))
                         .toSystemMessage());
     }
 
@@ -361,9 +386,7 @@ class DefaultAiServices<T> extends AiServices<T> {
         return context.systemMessageProvider.apply(memoryId);
     }
 
-    private static Map<String, Object> findTemplateVariables(String template, Method method, Object[] args) {
-        Parameter[] parameters = method.getParameters();
-
+    private static Map<String, Object> findTemplateVariables(String template, Parameter[] parameters, Object[] args) {
         Map<String, Object> variables = new HashMap<>();
         for (int i = 0; i < parameters.length; i++) {
             String variableName = getVariableName(parameters[i]);
@@ -414,21 +437,52 @@ class DefaultAiServices<T> extends AiServices<T> {
     }
 
     private static UserMessage prepareUserMessage(Method method, Object[] args) {
+        Optional<UserMessage> maybeUserMessage = findUserMessage(args);
+
+        if (maybeUserMessage.isPresent()) {
+            return maybeUserMessage.get();
+        }
 
         String template = getUserMessageTemplate(method, args);
-        Map<String, Object> variables = findTemplateVariables(template, method, args);
+        Parameter[] parameters = method.getParameters();
+        Map<String, Object> variables = findTemplateVariables(template, parameters, args);
 
         Prompt prompt = PromptTemplate.from(template).apply(variables);
 
-        Optional<String> maybeUserName = findUserName(method.getParameters(), args);
-        return maybeUserName.map(userName -> UserMessage.from(userName, prompt.text()))
-                .orElseGet(prompt::toUserMessage);
+        List<Content> contents = findUserContents(parameters, args);
+        contents.add(0, TextContent.from(prompt.text()));
+
+        Optional<String> maybeUserName = findUserName(parameters, args);
+        return maybeUserName.map(userName -> UserMessage.from(userName, contents))
+                .orElseGet(() -> UserMessage.from(contents));
+    }
+
+    private static Optional<UserMessage> findUserMessage(Object[] args) {
+        if (args != null) {
+            for (Object arg : args) {
+                if (arg instanceof UserMessage userMessage) {
+                    return Optional.of(userMessage);
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static List<Content> findUserContents(Parameter[] parameters, Object[] args) {
+        List<Content> contents = new LinkedList<>();
+        for (int i = 0; i < parameters.length; i++) {
+            if (parameters[i].isAnnotationPresent(dev.langchain4j.service.UserMessage.class) && args[i] instanceof Content content) {
+                contents.add(content);
+            }
+        }
+        return contents;
     }
 
     private static String getUserMessageTemplate(Method method, Object[] args) {
 
+        Parameter[] parameters = method.getParameters();
         Optional<String> templateFromMethodAnnotation = findUserMessageTemplateFromMethodAnnotation(method);
-        Optional<String> templateFromParameterAnnotation = findUserMessageTemplateFromAnnotatedParameter(method.getParameters(), args);
+        Optional<String> templateFromParameterAnnotation = findUserMessageTemplateFromAnnotatedParameter(parameters, args);
 
         if (templateFromMethodAnnotation.isPresent() && templateFromParameterAnnotation.isPresent()) {
             throw illegalConfiguration(
@@ -444,9 +498,9 @@ class DefaultAiServices<T> extends AiServices<T> {
             return templateFromParameterAnnotation.get();
         }
 
-        Optional<String> templateFromTheOnlyArgument = findUserMessageTemplateFromTheOnlyArgument(method.getParameters(), args);
-        if (templateFromTheOnlyArgument.isPresent()) {
-            return templateFromTheOnlyArgument.get();
+        Optional<String> templateFromNotAnnotatedParameter = findUserMessageTemplateFromNotAnnotatedParameter(parameters, args);
+        if (templateFromNotAnnotatedParameter.isPresent()) {
+            return templateFromNotAnnotatedParameter.get();
         }
 
         throw illegalConfiguration("Error: The method '%s' does not have a user message defined.", method.getName());
@@ -459,16 +513,18 @@ class DefaultAiServices<T> extends AiServices<T> {
 
     private static Optional<String> findUserMessageTemplateFromAnnotatedParameter(Parameter[] parameters, Object[] args) {
         for (int i = 0; i < parameters.length; i++) {
-            if (parameters[i].isAnnotationPresent(dev.langchain4j.service.UserMessage.class)) {
+            if (parameters[i].isAnnotationPresent(dev.langchain4j.service.UserMessage.class) && !(args[i] instanceof Content)) {
                 return Optional.of(toString(args[i]));
             }
         }
         return Optional.empty();
     }
 
-    private static Optional<String> findUserMessageTemplateFromTheOnlyArgument(Parameter[] parameters, Object[] args) {
-        if (parameters != null && parameters.length == 1 && parameters[0].getAnnotations().length == 0) {
-            return Optional.of(toString(args[0]));
+    private static Optional<String> findUserMessageTemplateFromNotAnnotatedParameter(Parameter[] parameters, Object[] args) {
+        for (int i = 0; i < parameters.length; i++) {
+            if (parameters[i].getAnnotations().length == 0) {
+                return Optional.of(toString(args[i]));
+            }
         }
         return Optional.empty();
     }
