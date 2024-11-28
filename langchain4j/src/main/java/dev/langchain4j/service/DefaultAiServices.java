@@ -4,7 +4,6 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -20,8 +19,6 @@ import dev.langchain4j.rag.AugmentationResult;
 import dev.langchain4j.service.output.ServiceOutputParser;
 import dev.langchain4j.service.tool.ToolExecution;
 import dev.langchain4j.service.tool.ToolExecutor;
-import dev.langchain4j.service.tool.ToolProviderRequest;
-import dev.langchain4j.service.tool.ToolProviderResult;
 import dev.langchain4j.spi.services.TokenStreamAdapter;
 
 import java.lang.reflect.Array;
@@ -31,7 +28,6 @@ import java.lang.reflect.Proxy;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -120,69 +116,35 @@ class DefaultAiServices<T> extends AiServices<T> {
                         AiServicesInputMessageResolver aiServicesInputMessageResolver = AiServicesInputMessageResolver.from(aiServicesMethodParameter, aiServicesParameter -> DefaultAiServices.toString(aiServicesParameter.object()));
                         AiServicesInputMessageProcessor aiServicesInputMessageProcessor = AiServicesInputMessageProcessor.from(aiServicesInputMessageResolver, DEFAULT, context);
 
-                        Optional<SystemMessage> systemMessage = aiServicesInputMessageProcessor.systemMessage();
                         UserMessage userMessage = aiServicesInputMessageProcessor.userMessage();
 
-                        List<dev.langchain4j.rag.content.Content> augmentationResultContent = aiServicesInputMessageProcessor.augmentationResult(userMessage).map(AugmentationResult::contents).orElse(null);
+                        List<dev.langchain4j.rag.content.Content> augmentationResultContent = aiServicesInputMessageProcessor.augmentationResult(userMessage)
+                                .map(AugmentationResult::contents).orElse(null);
 
                         userMessage = aiServicesInputMessageProcessor.userMessageAugmented(userMessage);
 
                         userMessage = aiServicesInputMessageProcessor.userMessageOutputFormatInstructed(userMessage);
 
-                        aiServicesInputMessageProcessor.saveChatMemory(systemMessage, userMessage);
+                        aiServicesInputMessageProcessor.saveChatMemory(userMessage);
 
-                        List<ChatMessage> messages = aiServicesInputMessageProcessor.messages(systemMessage, userMessage);
+                        List<ChatMessage> messages = aiServicesInputMessageProcessor.messages(userMessage);
 
                         Future<Moderation> moderationFuture = triggerModerationIfNeeded(method, messages);
+
+                        List<ToolSpecification> toolSpecifications = aiServicesInputMessageProcessor.toolSpecifications(userMessage);
+
+                        Map<String, ToolExecutor> toolExecutors = aiServicesInputMessageProcessor.toolExecutors(userMessage);
+
+                        Optional<Object> tokenStream = aiServicesInputMessageProcessor.tokenStream(userMessage);
+
+                        if (tokenStream.isPresent()) {
+                            return tokenStream.get();
+                        }
 
                         // TODO continue refactoring from here
 
 
-
-
-                        List<ToolSpecification> toolSpecifications = context.toolSpecifications;
-                        Map<String, ToolExecutor> toolExecutors = context.toolExecutors;
-
-                        if (context.toolProvider != null) {
-                            toolSpecifications = new ArrayList<>();
-                            toolExecutors = new HashMap<>();
-                            ToolProviderRequest toolProviderRequest = new ToolProviderRequest(memoryId, userMessage);
-                            ToolProviderResult toolProviderResult = context.toolProvider.provideTools(toolProviderRequest);
-                            if (toolProviderResult != null) {
-                                Map<ToolSpecification, ToolExecutor> tools = toolProviderResult.tools();
-                                for (ToolSpecification toolSpecification : tools.keySet()) {
-                                    toolSpecifications.add(toolSpecification);
-                                    toolExecutors.put(toolSpecification.name(), tools.get(toolSpecification));
-                                }
-                            }
-                        }
-
-
-
-
-
-
                         Type returnType = aiServicesInputMessageProcessor.returnType();
-                        if (aiServicesInputMessageProcessor.streaming()) {
-                            TokenStream tokenStream = new AiServiceTokenStream(
-                                    messages,
-                                    toolSpecifications,
-                                    toolExecutors,
-                                    augmentationResultContent,
-                                    context,
-                                    memoryId
-                            );
-                            // TODO moderation
-                            if (returnType == TokenStream.class) {
-                                return tokenStream;
-                            } else {
-                                return adapt(tokenStream, returnType);
-                            }
-                        }
-
-
-
-
 
 
                         Response<AiMessage> response;
@@ -277,15 +239,6 @@ class DefaultAiServices<T> extends AiServices<T> {
                         } else {
                             return parsedResponse;
                         }
-                    }
-
-                    private Object adapt(TokenStream tokenStream, Type returnType) {
-                        for (TokenStreamAdapter tokenStreamAdapter : tokenStreamAdapters) {
-                            if (tokenStreamAdapter.canAdaptTokenStreamTo(returnType)) {
-                                return tokenStreamAdapter.adapt(tokenStream);
-                            }
-                        }
-                        throw new IllegalStateException("Can't find suitable TokenStreamAdapter");
                     }
 
                     private Future<Moderation> triggerModerationIfNeeded(Method method, List<ChatMessage> messages) {

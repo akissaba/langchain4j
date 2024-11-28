@@ -39,7 +39,6 @@ public class MessageSanitizer {
             if (message instanceof UserMessage) {
                 if (lastWasUserMessage) {
                     toRemove.add(message);
-                    log.warn("Removing consecutive UserMessage: {}", ((UserMessage) message).singleText());
                 } else {
                     lastWasUserMessage = true;
                 }

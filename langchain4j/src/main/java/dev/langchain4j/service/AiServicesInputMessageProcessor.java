@@ -1,5 +1,6 @@
 package dev.langchain4j.service;
 
+import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
 import dev.langchain4j.data.message.SystemMessage;
@@ -14,11 +15,18 @@ import dev.langchain4j.rag.AugmentationRequest;
 import dev.langchain4j.rag.AugmentationResult;
 import dev.langchain4j.rag.query.Metadata;
 import dev.langchain4j.service.output.ServiceOutputParser;
+import dev.langchain4j.service.tool.ToolExecutor;
+import dev.langchain4j.service.tool.ToolProviderRequest;
+import dev.langchain4j.service.tool.ToolProviderResult;
 import dev.langchain4j.spi.services.TokenStreamAdapter;
 
 import java.lang.reflect.Type;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -27,9 +35,12 @@ import static dev.langchain4j.model.chat.Capability.RESPONSE_FORMAT_JSON_SCHEMA;
 import static dev.langchain4j.service.output.JsonSchemas.jsonSchemaFrom;
 import static dev.langchain4j.spi.ServiceHelper.loadFactories;
 import static java.lang.System.lineSeparator;
+import static java.util.Map.entry;
 import static java.util.Optional.ofNullable;
-import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.toMap;
+import static java.util.stream.Stream.concat;
+import static java.util.stream.Stream.of;
 
 public class AiServicesInputMessageProcessor {
     private AiServicesInputMessageResolver aiServicesInputMessageResolver;
@@ -51,13 +62,13 @@ public class AiServicesInputMessageProcessor {
                 .tokenStreamAdapters(loadFactories(TokenStreamAdapter.class));
     }
 
-    protected Optional<String> memoryId() {
+    protected String memoryId() {
         var aiServicesInputMessageResolver = aiServicesInputMessageResolver();
         return aiServicesInputMessageResolver
                 .aiServicesMethodParameter()
                 .findMemoryIdAnnotatedParameter()
                 .map(aiServicesInputMessageResolver.converter())
-                .or(() -> ofNullable(defaultMemoryId()));
+                .orElseGet(this::defaultMemoryId);
     }
 
     protected Optional<String> systemMessageTemplateFromMemoryId() {
@@ -100,13 +111,14 @@ public class AiServicesInputMessageProcessor {
                     var textContent = aiServicesInputMessageResolver.userMessageTemplate()
                             .map(userMessageTemplate -> {
                                 var templateValues = aiServicesInputMessageResolver.variables(userMessageTemplate);
-                                return PromptTemplate.from(userMessageTemplate).apply(templateValues);
+                                return PromptTemplate.from(userMessageTemplate)
+                                        .apply(templateValues);
                             })
                             .map(Prompt::text)
                             .map(TextContent::from).stream();
                     var contents = aiServicesMethodParameter.findValidContentInstances().stream()
                             .flatMap(aiServicesParameter -> aiServicesParameter.validContentInstance().stream());
-                    var userMessageContents = Stream.of(textContent, contents).flatMap(identity()).toList();
+                    var userMessageContents = concat(textContent, contents).toList();
                     return aiServicesMethodParameter.findUserNameAnnotatedParameter().map(aiServicesInputMessageResolver.converter())
                             .map(userName -> UserMessage.from(userName, userMessageContents))
                             .orElseGet(() -> UserMessage.from(userMessageContents));
@@ -132,23 +144,23 @@ public class AiServicesInputMessageProcessor {
     }
 
     public Optional<AugmentationResult> augmentationResult(UserMessage userMessage) {
+        var name = userMessage.name();
         return ofNullable(aiServiceContext())
                 .map(aiServiceContext -> {
-                    var name = userMessage.name();
-                    var textContent = textContent(userMessage);
+                    var textContent = textContent(userMessage).stream().toList();
                     var memoryId = memoryId();
-                    var chatMemory = memoryId
-                            .filter(mi -> aiServiceContext.hasChatMemory())
-                            .map(mi -> aiServiceContext.chatMemory(mi).messages());
-                    var userMessageText = UserMessage.from(name, textContent.stream().toList());
-                    var metadata = Metadata.from(userMessageText, memoryId.orElse(null), chatMemory.orElse(null));
+                    var chatMemory = chatMemory().map(ChatMemory::messages).orElse(null);
+                    var userMessageText = UserMessage.from(name, textContent);
+                    var metadata = Metadata.from(userMessageText, memoryId, chatMemory);
                     var augmentationRequest = new AugmentationRequest(userMessageText, metadata);
                     return aiServiceContext.retrievalAugmentor.augment(augmentationRequest);
                 })
                 .map(augmented -> ofNullable(augmented.chatMessage())
                         .filter(UserMessage.class::isInstance)
                         .map(UserMessage.class::cast)
-                        .map(um -> UserMessage.from(userMessage.name(), Stream.of(um.contents(), mediaContents(userMessage)).flatMap(List::stream).toList()))
+                        .map(UserMessage::contents)
+                        .map(contents -> concat(contents.stream(), mediaContents(userMessage).stream()).toList())
+                        .map(contents -> UserMessage.from(name, contents))
                         .map(um -> AugmentationResult.builder().chatMessage(um).build())
                         .orElse(augmented)
                 );
@@ -188,23 +200,22 @@ public class AiServicesInputMessageProcessor {
     }
 
     public Optional<JsonSchema> jsonSchema() {
-        var returnType = returnType();
         return supportsJsonSchema()
-                .flatMap(chatModel -> jsonSchemaFrom(returnType));
+                .flatMap(chatModel -> jsonSchemaFrom(returnType()));
     }
 
     // TODO append after storing in the memory?
     public UserMessage userMessageOutputFormatInstructed(UserMessage userMessage) {
         if (!streaming()) {
-            var returnType = returnType();
             var supportsJsonSchema = supportsJsonSchema();
             var jsonSchema = jsonSchema();
             if (supportsJsonSchema.isEmpty() || jsonSchema.isEmpty()) {
                 var name = userMessage.name();
-                var contents = userMessage.contents();
+                var contents = userMessage.contents().stream();
                 // TODO give user ability to provide custom OutputParser
-                var instructions = List.<Content>of(TextContent.from(serviceOutputParser().outputFormatInstructions(returnType)));
-                var userMessageContents = Stream.of(contents, instructions).flatMap(List::stream).toList();
+                var outputFormatInstructions = serviceOutputParser().outputFormatInstructions(returnType());
+                var instructions = of(TextContent.from(outputFormatInstructions));
+                var userMessageContents = concat(contents, instructions).toList();
                 userMessage = UserMessage.from(name, userMessageContents);
             }
         }
@@ -214,19 +225,74 @@ public class AiServicesInputMessageProcessor {
     public Optional<ChatMemory> chatMemory() {
         return ofNullable(aiServiceContext())
                 .filter(AiServiceContext::hasChatMemory)
-                .map(aiServiceContext -> aiServiceContext.chatMemory(memoryId().orElse(null)));
+                .map(aiServiceContext -> aiServiceContext.chatMemory(memoryId()));
     }
 
-    public void saveChatMemory(Optional<SystemMessage> systemMessage, UserMessage userMessage) {
+    public void saveChatMemory(UserMessage userMessage) {
         chatMemory().ifPresent(chatMemory ->
-                Stream.of(systemMessage.stream(), Stream.of(userMessage)).flatMap(identity())
+                concat(systemMessage().stream(), of(userMessage))
                         .forEach(chatMemory::add)
         );
     }
 
-    public List<ChatMessage> messages(Optional<SystemMessage> systemMessage, UserMessage userMessage) {
+    public List<ChatMessage> messages(UserMessage userMessage) {
         return chatMemory().map(ChatMemory::messages)
-                .orElseGet(() -> Stream.of(systemMessage.stream(), Stream.of(userMessage)).flatMap(identity()).toList());
+                .orElseGet(() -> concat(systemMessage().stream(), of(userMessage)).toList());
+    }
+
+    public Optional<Map<ToolSpecification, ToolExecutor>> tools(UserMessage userMessage) {
+        return ofNullable(aiServiceContext())
+                .map(aiServiceContext -> aiServiceContext.toolProvider)
+                .map(toolProvider -> {
+                    var toolProviderRequest = new ToolProviderRequest(memoryId(), userMessage);
+                    return toolProvider.provideTools(toolProviderRequest);
+                })
+                .map(ToolProviderResult::tools);
+    }
+
+    public List<ToolSpecification> toolSpecifications(UserMessage userMessage) {
+        return tools(userMessage)
+                .map(Map::keySet).map(LinkedList::new)
+                .orElseGet(() -> ofNullable(aiServiceContext())
+                        .map(aiServiceContext -> aiServiceContext.toolSpecifications).map(LinkedList::new)
+                        .orElse(null)
+                );
+    }
+
+    public Map<String, ToolExecutor> toolExecutors(UserMessage userMessage) {
+        return tools(userMessage)
+                .map(map -> map.entrySet().stream()
+                        .map(entry -> entry(entry.getKey().name(), entry.getValue()))
+                        .collect(toMap(Entry::getKey, Entry::getValue))
+                )
+                .orElseGet(() -> ofNullable(aiServiceContext())
+                        .map(aiServiceContext -> aiServiceContext.toolExecutors).map(LinkedHashMap::new)
+                        .orElse(null)
+                );
+    }
+
+    public Optional<AiServiceTokenStream> aiServiceTokenStream(UserMessage userMessage) {
+        return Optional.of(streaming()).filter(Boolean::booleanValue)
+                .map(b -> new AiServiceTokenStream(
+                        messages(userMessage),
+                        toolSpecifications(userMessage),
+                        toolExecutors(userMessage),
+                        augmentationResult(userMessage).map(AugmentationResult::contents).orElse(null),
+                        aiServiceContext(),
+                        memoryId()
+                ));
+    }
+
+    public Optional<Object> tokenStream(UserMessage userMessage) {
+        return aiServiceTokenStream(userMessage)
+                .map(aiServiceTokenStream ->
+                        // TODO moderation
+                        Objects.equals(returnType(), TokenStream.class)
+                                ? aiServiceTokenStream
+                                : tokenStreamAdaptersToReturnType().stream().findFirst()
+                                .map(tokenStreamAdapter -> tokenStreamAdapter.adapt(aiServiceTokenStream))
+                                .orElseThrow(() -> new IllegalStateException("Can't find suitable TokenStreamAdapter"))
+                );
     }
 
     public AiServicesInputMessageResolver aiServicesInputMessageResolver() {
