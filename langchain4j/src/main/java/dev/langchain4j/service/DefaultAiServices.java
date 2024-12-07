@@ -6,12 +6,6 @@ import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
-import dev.langchain4j.model.chat.request.ChatRequest;
-import dev.langchain4j.model.chat.request.ResponseFormat;
-import dev.langchain4j.model.chat.request.json.JsonSchema;
-import dev.langchain4j.model.chat.response.ChatResponse;
-import dev.langchain4j.model.input.structured.StructuredPrompt;
-import dev.langchain4j.model.input.structured.StructuredPromptProcessor;
 import dev.langchain4j.model.moderation.Moderation;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.model.output.TokenUsage;
@@ -21,7 +15,6 @@ import dev.langchain4j.service.tool.ToolExecution;
 import dev.langchain4j.service.tool.ToolExecutor;
 import dev.langchain4j.spi.services.TokenStreamAdapter;
 
-import java.lang.reflect.Array;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -38,7 +31,6 @@ import java.util.concurrent.Future;
 
 import static dev.langchain4j.exception.IllegalConfigurationException.illegalConfiguration;
 import static dev.langchain4j.internal.Exceptions.runtime;
-import static dev.langchain4j.model.chat.request.ResponseFormatType.JSON;
 import static dev.langchain4j.service.TypeUtils.typeHasRawClass;
 import static dev.langchain4j.spi.ServiceHelper.loadFactories;
 
@@ -51,29 +43,6 @@ class DefaultAiServices<T> extends AiServices<T> {
 
     DefaultAiServices(AiServiceContext context) {
         super(context);
-    }
-
-    private static String toString(Object arg) {
-        if (arg.getClass().isArray()) {
-            return arrayToString(arg);
-        } else if (arg.getClass().isAnnotationPresent(StructuredPrompt.class)) {
-            return StructuredPromptProcessor.toPrompt(arg).text();
-        } else {
-            return arg.toString();
-        }
-    }
-
-    private static String arrayToString(Object arg) {
-        StringBuilder sb = new StringBuilder("[");
-        int length = Array.getLength(arg);
-        for (int i = 0; i < length; i++) {
-            sb.append(toString(Array.get(arg, i)));
-            if (i < length - 1) {
-                sb.append(", ");
-            }
-        }
-        sb.append("]");
-        return sb.toString();
     }
 
     public T build() {
@@ -113,8 +82,8 @@ class DefaultAiServices<T> extends AiServices<T> {
 
                         Object memoryId = aiServicesMethodParameter.findMemoryIdAnnotatedParameter().flatMap(AiServicesParameter::memoryIdObject).orElse(DEFAULT);
 
-                        AiServicesInputMessageResolver aiServicesInputMessageResolver = AiServicesInputMessageResolver.from(aiServicesMethodParameter, aiServicesParameter -> DefaultAiServices.toString(aiServicesParameter.object()));
-                        AiServicesInputMessageProcessor aiServicesInputMessageProcessor = AiServicesInputMessageProcessor.from(aiServicesInputMessageResolver, DEFAULT, context);
+                        AiServicesInputMessageResolver aiServicesInputMessageResolver = AiServicesInputMessageResolver.from(aiServicesMethodParameter);
+                        AiServicesInputMessageProcessor aiServicesInputMessageProcessor = AiServicesInputMessageProcessor.from(serviceOutputParser, tokenStreamAdapters, aiServicesInputMessageResolver, DEFAULT, context, executor);
 
                         UserMessage userMessage = aiServicesInputMessageProcessor.userMessage();
 
@@ -127,19 +96,23 @@ class DefaultAiServices<T> extends AiServices<T> {
 
                         aiServicesInputMessageProcessor.saveChatMemory(userMessage);
 
-                        List<ChatMessage> messages = aiServicesInputMessageProcessor.messages(userMessage);
-
-                        Future<Moderation> moderationFuture = triggerModerationIfNeeded(method, messages);
-
-                        List<ToolSpecification> toolSpecifications = aiServicesInputMessageProcessor.toolSpecifications(userMessage);
-
-                        Map<String, ToolExecutor> toolExecutors = aiServicesInputMessageProcessor.toolExecutors(userMessage);
-
                         Optional<Object> tokenStream = aiServicesInputMessageProcessor.tokenStream(userMessage);
 
                         if (tokenStream.isPresent()) {
                             return tokenStream.get();
                         }
+
+                        List<ChatMessage> messages = aiServicesInputMessageProcessor.messages(userMessage);
+
+                        Optional<Future<Moderation>> moderationFuture = aiServicesInputMessageProcessor.triggerModerationIfNeeded(userMessage);
+
+                        AiServicesOutputMessageProcessor aiServicesOutputMessageProcessor = AiServicesOutputMessageProcessor.from(aiServicesInputMessageProcessor);
+
+                        Response<AiMessage> response = aiServicesOutputMessageProcessor.response(userMessage);
+
+                        List<ToolSpecification> toolSpecifications = aiServicesInputMessageProcessor.toolSpecifications(userMessage);
+
+                        Map<String, ToolExecutor> toolExecutors = aiServicesInputMessageProcessor.toolExecutors(userMessage);
 
                         // TODO continue refactoring from here
 
@@ -147,35 +120,9 @@ class DefaultAiServices<T> extends AiServices<T> {
                         Type returnType = aiServicesInputMessageProcessor.returnType();
 
 
-                        Response<AiMessage> response;
-                        Optional<JsonSchema> jsonSchema = aiServicesInputMessageProcessor.jsonSchema();
-                        if (aiServicesInputMessageProcessor.supportsJsonSchema().isPresent() && jsonSchema.isPresent()) {
-                            ChatRequest chatRequest = ChatRequest.builder()
-                                    .messages(messages)
-                                    .toolSpecifications(toolSpecifications)
-                                    .responseFormat(ResponseFormat.builder()
-                                            .type(JSON)
-                                            .jsonSchema(jsonSchema.get())
-                                            .build())
-                                    .build();
-
-                            ChatResponse chatResponse = context.chatModel.chat(chatRequest);
-
-                            response = new Response<>(
-                                    chatResponse.aiMessage(),
-                                    chatResponse.tokenUsage(),
-                                    chatResponse.finishReason()
-                            );
-                        } else {
-                            // TODO migrate to new API
-                            response = toolSpecifications == null
-                                    ? context.chatModel.generate(messages)
-                                    : context.chatModel.generate(messages, toolSpecifications);
-                        }
-
                         TokenUsage tokenUsageAccumulator = response.tokenUsage();
 
-                        verifyModerationIfNeeded(moderationFuture);
+                        aiServicesInputMessageProcessor.verifyModerationIfNeeded(moderationFuture);
 
                         int executionsLeft = MAX_SEQUENTIAL_TOOL_EXECUTIONS;
                         List<ToolExecution> toolExecutions = new ArrayList<>();
@@ -239,16 +186,6 @@ class DefaultAiServices<T> extends AiServices<T> {
                         } else {
                             return parsedResponse;
                         }
-                    }
-
-                    private Future<Moderation> triggerModerationIfNeeded(Method method, List<ChatMessage> messages) {
-                        if (method.isAnnotationPresent(Moderate.class)) {
-                            return executor.submit(() -> {
-                                List<ChatMessage> messagesToModerate = removeToolMessages(messages);
-                                return context.moderationModel.moderate(messagesToModerate).content();
-                            });
-                        }
-                        return null;
                     }
                 });
 

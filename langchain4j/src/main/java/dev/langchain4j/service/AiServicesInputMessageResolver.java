@@ -1,7 +1,13 @@
 package dev.langchain4j.service;
 
+import dev.langchain4j.model.input.structured.StructuredPrompt;
+import dev.langchain4j.model.input.structured.StructuredPromptProcessor;
+
+import java.lang.reflect.Array;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.function.Function;
@@ -23,10 +29,31 @@ public class AiServicesInputMessageResolver {
         super();
     }
 
-    public static AiServicesInputMessageResolver from(AiServicesMethodParameter aiServicesMethodParameter, Function<AiServicesParameter, String> converter) {
-        return new AiServicesInputMessageResolver()
-                .aiServicesMethodParameter(aiServicesMethodParameter)
-                .converter(converter);
+    public static AiServicesInputMessageResolver from(AiServicesMethodParameter aiServicesMethodParameter) {
+        var aiServicesInputMessageResolver = new AiServicesInputMessageResolver()
+                .aiServicesMethodParameter(aiServicesMethodParameter);
+        return aiServicesInputMessageResolver
+                .converter(aiServicesParameter -> aiServicesInputMessageResolver.convert(aiServicesParameter.object()));
+    }
+
+    protected String convert(Object object) {
+        if (object.getClass().isArray()) {
+            var list = new LinkedList<>();
+            var length = Array.getLength(object);
+            for (var i = 0; i < length; i++) {
+                var item = Array.get(object, i);
+                item = convert(item);
+                list.add(item);
+            }
+            return Objects.toString(list);
+        } else if (object.getClass().isAnnotationPresent(StructuredPrompt.class)) {
+            return StructuredPromptProcessor.toPrompt(object).text();
+        }
+        return Objects.toString(object);
+    }
+
+    protected Function<AiServicesParameter, String> defaultConverter() {
+        return aiServicesParameter -> convert(aiServicesParameter.object());
     }
 
     protected String template(String type, String resource, String delimiter, String[] value) {

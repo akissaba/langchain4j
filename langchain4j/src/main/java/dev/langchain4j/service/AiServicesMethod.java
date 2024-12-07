@@ -33,6 +33,14 @@ public class AiServicesMethod {
         return userMessageAnnotatedMethod().map(m -> m.getAnnotation(UserMessage.class));
     }
 
+    public Optional<Method> moderateAnnotatedMethod() {
+        return ofNullable(method()).filter(m -> m.isAnnotationPresent(Moderate.class));
+    }
+
+    public Optional<Moderate> moderateAnnotationMethod() {
+        return moderateAnnotatedMethod().map(m -> m.getAnnotation(Moderate.class));
+    }
+
     public Method method() {
         return method;
     }

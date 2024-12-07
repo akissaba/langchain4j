@@ -1,24 +1,14 @@
 package dev.langchain4j.service;
 
-import dev.langchain4j.agent.tool.ToolSpecification;
-import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.Content;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.TextContent;
-import dev.langchain4j.data.message.UserMessage;
-import dev.langchain4j.memory.ChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.request.json.JsonSchema;
-import dev.langchain4j.model.input.Prompt;
-import dev.langchain4j.model.input.PromptTemplate;
-import dev.langchain4j.rag.AugmentationRequest;
-import dev.langchain4j.rag.AugmentationResult;
-import dev.langchain4j.rag.query.Metadata;
-import dev.langchain4j.service.output.ServiceOutputParser;
-import dev.langchain4j.service.tool.ToolExecutor;
-import dev.langchain4j.service.tool.ToolProviderRequest;
-import dev.langchain4j.service.tool.ToolProviderResult;
-import dev.langchain4j.spi.services.TokenStreamAdapter;
+import static dev.langchain4j.model.chat.Capability.RESPONSE_FORMAT_JSON_SCHEMA;
+import static dev.langchain4j.service.output.JsonSchemas.jsonSchemaFrom;
+import static java.lang.System.lineSeparator;
+import static java.util.Map.entry;
+import static java.util.Optional.ofNullable;
+import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.toMap;
+import static java.util.stream.Stream.concat;
+import static java.util.stream.Stream.of;
 
 import java.lang.reflect.Type;
 import java.util.Collection;
@@ -29,37 +19,54 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.stream.Stream;
 
-import static dev.langchain4j.model.chat.Capability.RESPONSE_FORMAT_JSON_SCHEMA;
-import static dev.langchain4j.service.output.JsonSchemas.jsonSchemaFrom;
-import static dev.langchain4j.spi.ServiceHelper.loadFactories;
-import static java.lang.System.lineSeparator;
-import static java.util.Map.entry;
-import static java.util.Optional.ofNullable;
-import static java.util.stream.Collectors.joining;
-import static java.util.stream.Collectors.toMap;
-import static java.util.stream.Stream.concat;
-import static java.util.stream.Stream.of;
+import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.TextContent;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.request.json.JsonSchema;
+import dev.langchain4j.model.input.Prompt;
+import dev.langchain4j.model.input.PromptTemplate;
+import dev.langchain4j.model.moderation.Moderation;
+import dev.langchain4j.rag.AugmentationRequest;
+import dev.langchain4j.rag.AugmentationResult;
+import dev.langchain4j.rag.query.Metadata;
+import dev.langchain4j.service.output.ServiceOutputParser;
+import dev.langchain4j.service.tool.ToolExecutor;
+import dev.langchain4j.service.tool.ToolProviderRequest;
+import dev.langchain4j.service.tool.ToolProviderResult;
+import dev.langchain4j.spi.services.TokenStreamAdapter;
 
 public class AiServicesInputMessageProcessor {
     private AiServicesInputMessageResolver aiServicesInputMessageResolver;
     private String defaultMemoryId;
     private AiServiceContext aiServiceContext;
-    private ServiceOutputParser serviceOutputParser = new ServiceOutputParser();
-    private Collection<TokenStreamAdapter> tokenStreamAdapters = loadFactories(TokenStreamAdapter.class);
+    private ServiceOutputParser serviceOutputParser;
+    private Collection<TokenStreamAdapter> tokenStreamAdapters;
+    private ExecutorService executorService;
 
     public AiServicesInputMessageProcessor() {
         super();
     }
 
-    public static AiServicesInputMessageProcessor from(AiServicesInputMessageResolver aiServicesInputMessageResolver, String defaultMemoryId, AiServiceContext aiServiceContext) {
+    public static AiServicesInputMessageProcessor from(ServiceOutputParser serviceOutputParser, Collection<TokenStreamAdapter> tokenStreamAdapters, AiServicesInputMessageResolver aiServicesInputMessageResolver, String defaultMemoryId, AiServiceContext aiServiceContext, ExecutorService executorService) {
         return new AiServicesInputMessageProcessor()
+                .serviceOutputParser(serviceOutputParser)
+                .tokenStreamAdapters(tokenStreamAdapters)
                 .aiServicesInputMessageResolver(aiServicesInputMessageResolver)
                 .defaultMemoryId(defaultMemoryId)
                 .aiServiceContext(aiServiceContext)
-                .serviceOutputParser(new ServiceOutputParser())
-                .tokenStreamAdapters(loadFactories(TokenStreamAdapter.class));
+                .executorService(executorService);
     }
 
     protected String memoryId() {
@@ -295,6 +302,40 @@ public class AiServicesInputMessageProcessor {
                 );
     }
 
+    public Optional<Future<Moderation>> triggerModerationIfNeeded(UserMessage userMessage) {
+        return aiServicesInputMessageResolver()
+                .aiServicesMethodParameter()
+                .aiServicesMethod()
+                .moderateAnnotationMethod()
+                .map(moderate -> executorService()
+                        .submit(() -> {
+                            var messagesToModerate = messages(userMessage).stream()
+                                    .filter(chatMessage -> !(chatMessage instanceof ToolExecutionResultMessage))
+                                    .filter(chatMessage -> !(chatMessage instanceof AiMessage aiMessage && aiMessage.hasToolExecutionRequests()))
+                                    .toList();
+                            return aiServiceContext()
+                                    .moderationModel
+                                    .moderate(messagesToModerate)
+                                    .content();
+                        })
+                );
+    }
+
+    public void verifyModerationIfNeeded(Optional<Future<Moderation>> moderationFuture) {
+        moderationFuture.map(mf -> {
+                    try {
+                        return mf.get();
+                    } catch (InterruptedException | ExecutionException e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .filter(Moderation::flagged)
+                .map(Moderation::flaggedText)
+                .ifPresent(flaggedText -> {
+                    throw new ModerationException("Text \"%s\" violates content policy".formatted(flaggedText));
+                });
+    }
+
     public AiServicesInputMessageResolver aiServicesInputMessageResolver() {
         return aiServicesInputMessageResolver;
     }
@@ -313,15 +354,6 @@ public class AiServicesInputMessageProcessor {
         return this;
     }
 
-    public AiServiceContext aiServiceContext() {
-        return aiServiceContext;
-    }
-
-    public AiServicesInputMessageProcessor aiServiceContext(AiServiceContext aiServiceContext) {
-        this.aiServiceContext = aiServiceContext;
-        return this;
-    }
-
     public ServiceOutputParser serviceOutputParser() {
         return serviceOutputParser;
     }
@@ -337,6 +369,24 @@ public class AiServicesInputMessageProcessor {
 
     public AiServicesInputMessageProcessor tokenStreamAdapters(Collection<TokenStreamAdapter> tokenStreamAdapters) {
         this.tokenStreamAdapters = tokenStreamAdapters;
+        return this;
+    }
+
+    public AiServiceContext aiServiceContext() {
+        return aiServiceContext;
+    }
+
+    public AiServicesInputMessageProcessor aiServiceContext(AiServiceContext aiServiceContext) {
+        this.aiServiceContext = aiServiceContext;
+        return this;
+    }
+
+    public ExecutorService executorService() {
+        return executorService;
+    }
+
+    public AiServicesInputMessageProcessor executorService(ExecutorService executorService) {
+        this.executorService = executorService;
         return this;
     }
 }
